@@ -27,6 +27,12 @@ const (
 	// RejectJumpNotDest means a statically determinable jump target does
 	// not point at a JUMPDEST opcode.
 	RejectJumpNotDest RejectKind = "jump_target_not_jumpdest"
+	// RejectNoHaltingPath means no execution path from the entry block can
+	// reach a normal termination (STOP, RETURN, SELFDESTRUCT, or running
+	// off the end of the code, which the EVM treats as STOP). REVERT is
+	// not a normal termination. Reachable dynamic jumps make termination
+	// undecidable and are given the benefit of the doubt (not rejected).
+	RejectNoHaltingPath RejectKind = "no_halting_path"
 )
 
 // RejectError is the typed error returned for malformed contract input.
@@ -60,7 +66,9 @@ type DecodedContract struct {
 //  3. PUSHn immediate truncated by end of input;
 //  4. statically determinable jump targets (PUSHk <target> immediately
 //     followed by JUMP/JUMPI) pointing out of bounds;
-//  5. such targets not landing on JUMPDEST.
+//  5. such targets not landing on JUMPDEST;
+//  6. no path from the entry block reaching a normal termination
+//     (no_halting_path) — e.g. an unconditional jump loop.
 //
 // Jump targets supplied dynamically (not via an adjacent PUSH) cannot be
 // statically resolved and are intentionally not rejected.
@@ -106,7 +114,63 @@ func Decode(name string, code []byte) (*DecodedContract, error) {
 
 	stored := make([]byte, len(code))
 	copy(stored, code)
-	return &DecodedContract{Name: name, Code: stored, Instructions: insts}, nil
+	contract := &DecodedContract{Name: name, Code: stored, Instructions: insts}
+
+	if err := validateHaltingPath(contract); err != nil {
+		return nil, err
+	}
+	return contract, nil
+}
+
+// validateHaltingPath rejects contracts from which no statically reachable
+// execution path terminates normally. The check is a plain BFS over the
+// control-flow graph, so loops converge via the visited set and the check
+// is linear in the number of blocks.
+func validateHaltingPath(c *DecodedContract) error {
+	cfg := BuildCFG(c, SplitBlocks(c))
+	if len(cfg.Blocks) == 0 {
+		return nil
+	}
+	visited := make([]bool, len(cfg.Blocks))
+	queue := []int{cfg.Entry}
+	visited[cfg.Entry] = true
+	for len(queue) > 0 {
+		b := queue[0]
+		queue = queue[1:]
+		if cfg.HasDynamicJump[b] {
+			return nil // unknown successors: cannot prove non-termination
+		}
+		if isNormalHalt(cfg, b) {
+			return nil
+		}
+		for _, s := range cfg.Succ[b] {
+			if !visited[s] {
+				visited[s] = true
+				queue = append(queue, s)
+			}
+		}
+	}
+	return &RejectError{
+		Kind:   RejectNoHaltingPath,
+		Offset: -1,
+		Detail: "no reachable path from entry reaches STOP, RETURN, SELFDESTRUCT or end of code",
+	}
+}
+
+// isNormalHalt reports whether execution entering block b can terminate
+// normally inside it: the block ends in STOP/RETURN/SELFDESTRUCT, or it is
+// the last block and runs off the end of the code (implicit STOP). REVERT
+// is deliberately not a normal termination.
+func isNormalHalt(cfg *CFG, b int) bool {
+	last := cfg.Blocks[b].Insts[len(cfg.Blocks[b].Insts)-1]
+	switch last.Op {
+	case opcodes.STOP, opcodes.RETURN, opcodes.SELFDESTRUCT:
+		return true
+	}
+	if b == len(cfg.Blocks)-1 && len(cfg.Succ[b]) == 0 {
+		return true // falls off the end of the code: implicit STOP
+	}
+	return false
 }
 
 // validateStaticJumps checks every PUSHk/JUMP adjacency. The immediate is

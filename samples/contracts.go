@@ -57,6 +57,34 @@ func All() []Contract {
 			),
 			Expect: "ok, no findings (SELFDESTRUCT guarded by CALLER/EQ)",
 		},
+		{
+			Name: "benign_guarded_cross_block",
+			// guard in block 0, SELFDESTRUCT in a later block reached only
+			// through the guarded path:
+			// 0: PUSH1 0xAA CALLER EQ ISZERO PUSH1 0x0b JUMPI
+			// 8: PUSH1 0x0d JUMP   11: JUMPDEST STOP   13: JUMPDEST PUSH1 0 SELFDESTRUCT
+			Code: build(
+				p1(0xAA),
+				[]byte{byte(opcodes.CALLER), byte(opcodes.EQ), byte(opcodes.ISZERO)},
+				p1(0x0b),
+				[]byte{byte(opcodes.JUMPI)},
+				p1(0x0d),
+				[]byte{byte(opcodes.JUMP), byte(opcodes.JUMPDEST), byte(opcodes.STOP), byte(opcodes.JUMPDEST)},
+				p1(0x00),
+				[]byte{byte(opcodes.SELFDESTRUCT)},
+			),
+			Expect: "ok, no findings (guard in an earlier block dominates SELFDESTRUCT)",
+		},
+		{
+			Name: "benign_call_then_halt_dead_sstore",
+			// PUSH1 0 CALL STOP | JUMPDEST SSTORE STOP
+			// the SSTORE segment is unreachable from the call
+			Code: build(
+				p1(0x00),
+				[]byte{byte(opcodes.CALL), byte(opcodes.STOP), byte(opcodes.JUMPDEST), byte(opcodes.SSTORE), byte(opcodes.STOP)},
+			),
+			Expect: "ok, no findings (no path from CALL reaches the SSTORE)",
+		},
 
 		// ---- risky ----
 		{
@@ -67,6 +95,56 @@ func All() []Contract {
 				[]byte{byte(opcodes.CALL), byte(opcodes.SSTORE), byte(opcodes.STOP)},
 			),
 			Expect: "finding REENTRANCY-STATE-WRITE-AFTER-CALL",
+		},
+		{
+			Name: "risky_reentrancy_cross_block",
+			// PUSH1 0 CALL PUSH1 0x06 JUMP | JUMPDEST SSTORE STOP
+			// the state write sits in another block reached by a jump
+			Code: build(
+				p1(0x00),
+				[]byte{byte(opcodes.CALL)},
+				p1(0x06),
+				[]byte{byte(opcodes.JUMP), byte(opcodes.JUMPDEST), byte(opcodes.SSTORE), byte(opcodes.STOP)},
+			),
+			Expect: "finding REENTRANCY-STATE-WRITE-AFTER-CALL with path [2 6 7]",
+		},
+		{
+			Name: "risky_reentrancy_via_loop",
+			// 0: JUMPDEST PUSH1 0 CALL PUSH1 0x0a JUMPI
+			// 7: PUSH1 0 JUMP (back edge to 0)
+			// 10: JUMPDEST SSTORE STOP
+			// the SSTORE is reachable from the CALL only after looping
+			Code: build(
+				[]byte{byte(opcodes.JUMPDEST)},
+				p1(0x00),
+				[]byte{byte(opcodes.CALL)},
+				p1(0x0a),
+				[]byte{byte(opcodes.JUMPI)},
+				p1(0x00),
+				[]byte{byte(opcodes.JUMP), byte(opcodes.JUMPDEST), byte(opcodes.SSTORE), byte(opcodes.STOP)},
+			),
+			Expect: "finding REENTRANCY-STATE-WRITE-AFTER-CALL (loop converges, exactly one hit)",
+		},
+		{
+			Name: "risky_guard_bypass_branch",
+			// 0: PUSH1 1 PUSH1 0x08 JUMPI          ; cond branch
+			// 5: PUSH1 0 SELFDESTRUCT              ; unguarded fallthrough
+			// 8: JUMPDEST PUSH1 0xAA CALLER EQ ISZERO PUSH1 0x14 JUMPI
+			// 17: PUSH1 0 SELFDESTRUCT             ; guarded
+			// 20: JUMPDEST STOP
+			Code: build(
+				p1(0x01), p1(0x08),
+				[]byte{byte(opcodes.JUMPI)},
+				p1(0x00),
+				[]byte{byte(opcodes.SELFDESTRUCT), byte(opcodes.JUMPDEST)},
+				p1(0xAA),
+				[]byte{byte(opcodes.CALLER), byte(opcodes.EQ), byte(opcodes.ISZERO)},
+				p1(0x14),
+				[]byte{byte(opcodes.JUMPI)},
+				p1(0x00),
+				[]byte{byte(opcodes.SELFDESTRUCT), byte(opcodes.JUMPDEST), byte(opcodes.STOP)},
+			),
+			Expect: "finding PRIVILEGED-UNPROTECTED-SELFDESTRUCT for offset 7 only (branch bypasses the guard)",
 		},
 		{
 			Name: "risky_unchecked_call",
@@ -87,11 +165,13 @@ func All() []Contract {
 			Name: "risky_combo",
 			// PUSH1 0 CALL POP            -> unchecked call
 			// PUSH1 0 PUSH1 0 CALL SSTORE -> reentrancy
+			// (path semantics: the SSTORE is reachable from BOTH calls,
+			//  so two reentrancy findings are expected)
 			Code: build(
 				p1(0x00), []byte{byte(opcodes.CALL), byte(opcodes.POP)},
 				p1(0x00), p1(0x00), []byte{byte(opcodes.CALL), byte(opcodes.SSTORE), byte(opcodes.STOP)},
 			),
-			Expect: "findings UNCHECKED-CALL-RETURN + reentrancy",
+			Expect: "findings UNCHECKED-CALL-RETURN + 2x reentrancy (SSTORE reachable from both calls)",
 		},
 
 		// ---- malformed: must be rejected with distinguishable reasons ----
@@ -123,6 +203,13 @@ func All() []Contract {
 			// PUSH1 0 JUMP STOP ; target 0 is a PUSH1, not JUMPDEST
 			Code:   build(p1(0x00), []byte{byte(opcodes.JUMP), byte(opcodes.STOP)}),
 			Expect: "rejected: jump_target_not_jumpdest",
+		},
+		{
+			Name: "malformed_jump_loop_no_halt",
+			// JUMPDEST PUSH1 0 JUMP ; an unconditional jump loop that can
+			// never reach STOP/RETURN/SELFDESTRUCT or end of code
+			Code:   build([]byte{byte(opcodes.JUMPDEST)}, p1(0x00), []byte{byte(opcodes.JUMP)}),
+			Expect: "rejected: no_halting_path",
 		},
 	}
 }

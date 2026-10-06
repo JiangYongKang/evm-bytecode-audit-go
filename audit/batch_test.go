@@ -172,3 +172,47 @@ func TestCache_NeverReturnsMismatchedInput(t *testing.T) {
 	}
 	t.Logf("input=0x00 cached; lookups with 0x01/nil miss; forged hash report refused -> no mismatched conclusions possible")
 }
+
+// genLoopedChain builds a contract of n blocks, each with a CALL and a
+// JUMPI back edge to itself, falling through to the next block; the final
+// block holds the only SSTORE. Every CALL therefore has a long witness
+// path and every block carries a loop: a stress shape for path analysis.
+func genLoopedChain(n int) []byte {
+	var code []byte
+	for i := 0; i < n; i++ {
+		self := len(code)
+		code = append(code, 0x5b)                            // JUMPDEST
+		code = append(code, 0x60, 0x00)                      // PUSH1 0
+		code = append(code, 0xf1)                            // CALL
+		code = append(code, 0x61, byte(self>>8), byte(self)) // PUSH2 self
+		code = append(code, 0x57)                            // JUMPI
+	}
+	code = append(code, 0x5b, 0x55, 0x00) // JUMPDEST SSTORE STOP
+	return code
+}
+
+func TestBatch_LargeInputScalesAndStaysDeterministic(t *testing.T) {
+	const n = 1000
+	code := genLoopedChain(n)
+	inputs := []audit.ContractInput{{Name: "large_looped_chain", Code: code}}
+
+	start := time.Now()
+	serial := audit.NewAnalyzer(nil).Analyze("large_looped_chain", code)
+	elapsed := time.Since(start)
+	if serial.Status != audit.StatusOK {
+		t.Fatalf("status = %s (%s)", serial.Status, serial.RejectDetail)
+	}
+	if len(serial.Findings) != n {
+		t.Fatalf("findings = %d, want %d (one per CALL)", len(serial.Findings), n)
+	}
+	sj, _ := json.Marshal(serial)
+	for _, workers := range []int{1, 4, 8} {
+		got := audit.NewBatch(audit.NewAnalyzer(nil), nil, 0, workers).Run(inputs)
+		gj, _ := json.Marshal(got[0])
+		if string(gj) != string(sj) {
+			t.Fatalf("workers=%d: concurrent result differs from serial", workers)
+		}
+	}
+	t.Logf("input=%d blocks x (CALL + loop back-edge), %d bytes -> %d findings in %s; workers 1/4/8 byte-identical",
+		n, len(code), len(serial.Findings), elapsed.Round(time.Millisecond))
+}

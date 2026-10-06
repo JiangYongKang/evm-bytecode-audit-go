@@ -2,7 +2,8 @@
 
 一个**完全本地、无外部依赖、无凭据**的 EVM 字节码静态审计流程。输入是手工构造的
 样例合约字节码（见 `samples` 包），输出是确定性的 JSON 审计结论。畸形输入被拒绝、
-风险路径被规则命中并附带可核对证据，多合约并发审计与串行结论一致且输出顺序稳定。
+风险路径被**路径级**规则（控制流图可达性）命中并附带按执行顺序排列的见证路径证据，
+多合约并发审计与串行结论一致且输出顺序稳定。
 
 ## 快速开始
 
@@ -40,9 +41,18 @@ go run ./cmd/audit -timeout 5s -workers 4
 | `truncated_immediate` | `PUSHn` 的立即数超出输入末尾，报告 `PUSH` 偏移与缺失字节数 |
 | `jump_target_out_of_bounds` | 紧邻 `JUMP/JUMPI` 之前的 `PUSHk` 目标 ≥ 字节码长度 |
 | `jump_target_not_jumpdest` | 上述静态目标存在，但落点不是 `JUMPDEST`（包括落在立即数字节上） |
+| `no_halting_path` | 从入口块出发，沿静态控制流图**没有任何可达路径**到达正常结束（见下） |
 
 跳转目标若由运行时动态计算（前一条不是 `PUSH`），静态不可判定，**不**因此拒绝。
 被拒绝的输入**不会进入任何规则分析**，报告状态为 `rejected`。
+
+### 正常结束判定（`no_halting_path`）
+
+解码通过后，在控制流图（CFG，见下）上从入口块做 BFS：若所有静态可达块都
+无法到达 `STOP`/`RETURN`/`SELFDESTRUCT`，也无法"跑过字节码末尾"（EVM 语义等同
+`STOP`），则拒绝。`REVERT` **不**算正常结束。可达的动态跳转（目标静态不可知）
+按"可能终止"处理，不误拒。该检查为图上一次遍历，带环输入靠 visited 集合收敛，
+不会无限展开。六类拒绝原因互斥、按上述顺序首个命中即返回。
 
 ## 规则语义
 
@@ -60,31 +70,36 @@ go run ./cmd/audit -timeout 5s -workers 4
 `benign_guarded_selfdestruct` 展示了被识别的 `PUSH owner; CALLER; EQ; ISZERO;
 PUSH deny; JUMPI ... SELFDESTRUCT` 所有权模式。
 
-## 证据格式
+## 证据格式（含路径定位）
 
-每个 `Finding` 至少包含一条 `Evidence`：
+每个 `Finding` 至少包含一条 `Evidence`。路径级规则的 `offsets` 是**见证路径**：
+按执行顺序列出这条路径上经过的关键位置（调用点/入口点、沿途每个被进入基本块的
+`JUMPDEST` 偏移、最终的写入/特权指令偏移），可一段段对着原始字节码核对：
 
 ```json
 {
   "rule_id": "REENTRANCY-STATE-WRITE-AFTER-CALL",
   "severity": "high",
-  "message": "state write at offset 5 follows external CALL at offset 4 within block 0 (reentrancy window)",
+  "message": "state write at offset 7 is reachable from external CALL at offset 2 along a 2-hop control-flow path (reentrancy window)",
   "evidence": [{
-    "description": "external call precedes storage write before any halting instruction in the same basic block",
-    "offsets": [0, 4, 5],
+    "description": "an execution path from the external call reaches a storage write; offsets list the path's key positions in execution order",
+    "offsets": [2, 6, 7],
     "details": {
-      "block_index": 0, "block_start": 0,
-      "call_offset": 4, "call_opcode": "CALL",
-      "sstore_offset": 5, "state_opcode": "SSTORE",
-      "rule_version": "1.0.0"
+      "call_offset": 2, "call_opcode": "CALL",
+      "sstore_offset": 7, "state_opcode": "SSTORE",
+      "path_blocks": [0, 1],
+      "rule_version": "2.0.0"
     }
   }]
 }
 ```
 
-- `offsets` 全部是**原始字节码内的字节偏移**，审计者可直接回到输入逐字节核对
-  （单测中会重新用这些偏移索引原始字节并断言操作码）。
-- `details` 给出判定要素（块号、调用/写入位置、缺失的保护指令等）。
+- `offsets` 全部是**原始字节码内的字节偏移**（单测会重新用这些偏移索引原始字节
+  并断言操作码）。重入规则：`[call_offset, 沿途块入口..., sstore_offset]`；
+  特权规则：`[入口块起点, 沿途块入口..., selfdestruct_offset]`（即绕开守卫的那条
+  路径）。环路回边会使偏移序列非单调，这是执行顺序而非偏移排序。
+- `details.path_blocks` 给出与 `offsets` 对应的块下标序列；`missing_guard` 说明
+  绕过路径上缺失的守卫成分（`CALLER and EQ` / `EQ` / 守卫存在但被绕过）。
 
 ## 报告结构
 
@@ -116,8 +131,8 @@ PUSH deny; JUMPI ... SELFDESTRUCT` 所有权模式。
 | 包 | 职责 |
 |---|---|
 | `opcodes` | 操作码编号、元数据表与分类谓词 |
-| `bytecode` | 解码、类型化拒绝原因、基本块划分 |
-| `rules` | 三条确定性风险规则与证据构造 |
+| `bytecode` | 解码、类型化拒绝原因、基本块划分、控制流图（`cfg.go`）与停机路径校验 |
+| `rules` | 三条确定性风险规则、路径级 BFS 与证据构造（`paths.go` 为共享索引） |
 | `audit` | 分析器、报告、哈希缓存、并发批处理 |
 | `samples` | 良性/风险/畸形本地样例合约及预期结论 |
 | `cmd/audit` | 命令行入口，输出 JSON 报告 |
