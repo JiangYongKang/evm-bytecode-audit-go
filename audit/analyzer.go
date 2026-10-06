@@ -62,6 +62,16 @@ func (a *Analyzer) Analyze(name string, code []byte) (report *Report) {
 	}
 
 	blocks := bytecode.SplitBlocks(decoded)
+	// Path-level well-formedness: the contract must be able to reach a
+	// normal exit. This rejection is distinct from decode-time rejections
+	// (RejectNoReachableExit) and runs before any rule.
+	if err := bytecode.CheckReachableExit(decoded, blocks); err != nil {
+		rj := err.(*bytecode.RejectError)
+		base.Status = StatusRejected
+		base.RejectKind = rj.Kind
+		base.RejectDetail = rj.Error()
+		return &base
+	}
 	for _, rule := range a.rules {
 		base.Findings = append(base.Findings, rule.Check(decoded, blocks)...)
 	}

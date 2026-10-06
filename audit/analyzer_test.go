@@ -56,15 +56,20 @@ func TestAnalyzer_ExpectedSampleVerdicts(t *testing.T) {
 		{"benign_empty_stop", audit.StatusOK, "", nil},
 		{"benign_valid_jump", audit.StatusOK, "", nil},
 		{"benign_guarded_selfdestruct", audit.StatusOK, "", nil},
+		{"benign_call_then_halt", audit.StatusOK, "", nil},
+		{"benign_guarded_loop_selfdestruct", audit.StatusOK, "", nil},
 		{"risky_reentrancy", audit.StatusOK, "", []rules.RuleID{rules.RuleReentrancy}},
+		{"risky_reentrancy_cross_block", audit.StatusOK, "", []rules.RuleID{rules.RuleReentrancy}},
+		{"risky_privileged_branch_bypass", audit.StatusOK, "", []rules.RuleID{rules.RuleUnprotectedPrivileged}},
 		{"risky_unchecked_call", audit.StatusOK, "", []rules.RuleID{rules.RuleUncheckedCall}},
 		{"risky_unprotected_selfdestruct", audit.StatusOK, "", []rules.RuleID{rules.RuleUnprotectedPrivileged}},
-		{"risky_combo", audit.StatusOK, "", []rules.RuleID{rules.RuleReentrancy, rules.RuleUncheckedCall}},
+		{"risky_combo", audit.StatusOK, "", []rules.RuleID{rules.RuleReentrancy, rules.RuleReentrancy, rules.RuleUncheckedCall}},
 		{"malformed_empty", audit.StatusRejected, bytecode.RejectEmpty, nil},
 		{"malformed_invalid_opcode", audit.StatusRejected, bytecode.RejectInvalidOpcode, nil},
 		{"malformed_truncated_push", audit.StatusRejected, bytecode.RejectTruncatedImmediate, nil},
 		{"malformed_jump_out_of_bounds", audit.StatusRejected, bytecode.RejectJumpOutOfBounds, nil},
 		{"malformed_jump_not_jumpdest", audit.StatusRejected, bytecode.RejectJumpNotDest, nil},
+		{"malformed_no_reachable_exit", audit.StatusRejected, bytecode.RejectNoReachableExit, nil},
 	}
 	byName := map[string]samples.Contract{}
 	for _, s := range samples.All() {
@@ -114,4 +119,34 @@ func TestAnalyzer_RuleVersionChangeIsReproducible(t *testing.T) {
 	}
 	t.Logf("report pins %s@%s for input sha=%s -> historical re-run is possible",
 		r.RuleVersions[0].RuleID, r.RuleVersions[0].Version, shortHash(r.InputHash))
+}
+
+func TestAnalyzer_NoReachableExitRegression(t *testing.T) {
+	// Regression: this input decodes cleanly and its static jump is valid,
+	// so it used to be reported as a clean contract ("ok", no findings).
+	// But its only reachable path loops forever — no execution can reach a
+	// normal end — so it must now be rejected with a reason that is
+	// distinct from every decode-time rejection.
+	code := []byte{0x5b, 0x60, 0x00, 0x56} // JUMPDEST PUSH1 0 JUMP
+	a := audit.NewAnalyzer(nil)
+	r := a.Analyze("regression_no_exit", code)
+	summary(t, r)
+	if r.Status != audit.StatusRejected {
+		t.Fatalf("status = %s, want rejected (previously judged clean)", r.Status)
+	}
+	if r.RejectKind != bytecode.RejectNoReachableExit {
+		t.Fatalf("reject kind = %q, want %q", r.RejectKind, bytecode.RejectNoReachableExit)
+	}
+	for _, k := range []bytecode.RejectKind{
+		bytecode.RejectEmpty, bytecode.RejectInvalidOpcode, bytecode.RejectTruncatedImmediate,
+		bytecode.RejectJumpOutOfBounds, bytecode.RejectJumpNotDest,
+	} {
+		if r.RejectKind == k {
+			t.Fatalf("reject kind %q must be distinguishable from decode-time kinds", r.RejectKind)
+		}
+	}
+	if len(r.Findings) != 0 {
+		t.Fatalf("rejected input must carry no findings, got %v", r.Findings)
+	}
+	t.Logf("verdict basis: %s", r.RejectDetail)
 }
